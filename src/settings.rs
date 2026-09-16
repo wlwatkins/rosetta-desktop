@@ -65,49 +65,51 @@ impl Settings {
     /// Reads the file if present, then layers the environment on top.
     pub fn load() -> (Self, Overrides) {
         let mut settings = Self::from_file().unwrap_or_default();
+        let over = settings.apply_overrides(|key| std::env::var(key).ok());
+        (settings, over)
+    }
+
+    /// The environment layer, taking its lookup as an argument so it can be
+    /// exercised without mutating the process environment (which is global, and
+    /// would race with tests running in parallel).
+    pub fn apply_overrides(&mut self, get: impl Fn(&str) -> Option<String>) -> Overrides {
         let mut over = Overrides::default();
 
-        if let Ok(v) = std::env::var("ROSETTA_HOTKEY") {
-            settings.hotkey = v;
+        if let Some(v) = get("ROSETTA_HOTKEY") {
+            self.hotkey = v;
             over.0.push("hotkey");
         }
-        if let Ok(v) = std::env::var("ROSETTA_THEME") {
-            settings.theme = v;
+        if let Some(v) = get("ROSETTA_THEME") {
+            self.theme = v;
             over.0.push("theme");
         }
-        if let Ok(v) = std::env::var("ROSETTA_BEAMS") {
-            if let Ok(n) = v.parse::<usize>() {
-                settings.beams = n.max(1);
-                over.0.push("beams");
-            }
+        if let Some(n) = get("ROSETTA_BEAMS").and_then(|v| v.parse::<usize>().ok()) {
+            self.beams = n.max(1);
+            over.0.push("beams");
         }
-        if let Ok(v) = std::env::var("ROSETTA_BACKEND") {
-            settings.backend = v;
+        if let Some(v) = get("ROSETTA_BACKEND") {
+            self.backend = v;
             over.0.push("backend");
         }
-        if let Ok(v) = std::env::var("ROSETTA_LANG") {
-            settings.lang = v;
+        if let Some(v) = get("ROSETTA_LANG") {
+            self.lang = v;
             over.0.push("lang");
         }
-        if let Ok(v) = std::env::var("ROSETTA_UPSCALE") {
-            if let Ok(n) = v.parse::<u32>() {
-                settings.upscale = n.max(1);
-                over.0.push("upscale");
-            }
+        if let Some(n) = get("ROSETTA_UPSCALE").and_then(|v| v.parse::<u32>().ok()) {
+            self.upscale = n.max(1);
+            over.0.push("upscale");
         }
-        if let Ok(v) = std::env::var("ROSETTA_PSM") {
-            if let Ok(n) = v.parse::<i32>() {
-                settings.psm = n;
-                over.0.push("psm");
-            }
+        if let Some(n) = get("ROSETTA_PSM").and_then(|v| v.parse::<i32>().ok()) {
+            self.psm = n;
+            over.0.push("psm");
         }
-        if std::env::var("ROSETTA_DEBUG").is_ok() {
-            settings.debug_log = true;
+        if get("ROSETTA_DEBUG").is_some() {
+            self.debug_log = true;
             over.0.push("debug_log");
         }
 
-        settings.clamp();
-        (settings, over)
+        self.clamp();
+        over
     }
 
     fn from_file() -> Option<Self> {

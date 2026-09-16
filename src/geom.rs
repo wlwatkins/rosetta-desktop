@@ -78,3 +78,107 @@ impl Rect {
         inter as f32 / union as f32
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_points_normalizes_any_drag_direction() {
+        let expected = Rect::new(10, 20, 30, 40);
+        // All four drag directions must describe the same rectangle.
+        assert_eq!(Rect::from_points(10, 20, 40, 60), expected);
+        assert_eq!(Rect::from_points(40, 60, 10, 20), expected);
+        assert_eq!(Rect::from_points(40, 20, 10, 60), expected);
+        assert_eq!(Rect::from_points(10, 60, 40, 20), expected);
+    }
+
+    #[test]
+    fn edges_and_emptiness() {
+        let r = Rect::new(5, 7, 10, 20);
+        assert_eq!((r.right(), r.bottom()), (15, 27));
+        assert!(!r.is_empty());
+        assert!(Rect::new(0, 0, 0, 5).is_empty());
+        assert!(Rect::new(0, 0, 5, 0).is_empty());
+        assert!(Rect::new(0, 0, -3, 5).is_empty());
+    }
+
+    #[test]
+    fn contains_excludes_the_far_edges() {
+        let r = Rect::new(0, 0, 10, 10);
+        assert!(r.contains(0, 0));
+        assert!(r.contains(9, 9));
+        // right() and bottom() are one past the last pixel.
+        assert!(!r.contains(10, 5));
+        assert!(!r.contains(5, 10));
+        assert!(!r.contains(-1, 5));
+    }
+
+    #[test]
+    fn negative_origins_work() {
+        // The virtual desktop starts at a negative x on a left-hand monitor.
+        let r = Rect::new(-1920, 0, 1920, 1080);
+        assert_eq!(r.right(), 0);
+        assert!(r.contains(-1000, 500));
+        assert!(!r.contains(0, 500));
+    }
+
+    #[test]
+    fn inflate_grows_on_every_side() {
+        let r = Rect::new(10, 10, 20, 20).inflate(5);
+        assert_eq!(r, Rect::new(5, 5, 30, 30));
+        assert_eq!(Rect::new(10, 10, 20, 20).inflate(-2), Rect::new(12, 12, 16, 16));
+    }
+
+    #[test]
+    fn offset_by_round_trips() {
+        let r = Rect::new(3, 4, 10, 10);
+        assert_eq!(r.offset_by(100, 200).offset_by(-100, -200), r);
+    }
+
+    #[test]
+    fn intersection_of_overlapping_rects() {
+        let a = Rect::new(0, 0, 10, 10);
+        let b = Rect::new(5, 5, 10, 10);
+        assert_eq!(a.intersection(&b), Rect::new(5, 5, 5, 5));
+        assert!(a.intersects(&b));
+    }
+
+    #[test]
+    fn disjoint_rects_do_not_intersect() {
+        let a = Rect::new(0, 0, 10, 10);
+        let b = Rect::new(20, 20, 5, 5);
+        assert!(a.intersection(&b).is_empty());
+        assert!(!a.intersects(&b));
+        // Touching edges share no pixels.
+        assert!(!a.intersects(&Rect::new(10, 0, 5, 10)));
+    }
+
+    #[test]
+    fn iou_of_identical_rects_is_one() {
+        let a = Rect::new(2, 3, 8, 9);
+        assert!((a.iou(&a) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn iou_of_disjoint_rects_is_zero() {
+        let a = Rect::new(0, 0, 10, 10);
+        assert_eq!(a.iou(&Rect::new(50, 50, 10, 10)), 0.0);
+    }
+
+    #[test]
+    fn iou_of_half_overlap() {
+        // 10x10 over 10x10 sharing a 5x10 strip: 50 / (100 + 100 - 50).
+        let a = Rect::new(0, 0, 10, 10);
+        let b = Rect::new(5, 0, 10, 10);
+        assert!((a.iou(&b) - (50.0 / 150.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn iou_survives_large_coordinates() {
+        // area() is i64 precisely so a 4K-wide rect cannot overflow.
+        let a = Rect::new(0, 0, 3840, 2160);
+        assert_eq!(a.area(), 8_294_400);
+        assert!((a.iou(&a) - 1.0).abs() < 1e-6);
+    }
+}
