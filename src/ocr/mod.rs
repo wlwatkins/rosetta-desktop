@@ -117,3 +117,93 @@ impl OcrEngine {
         Ok(lines)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `n` pixels of one BGRA colour.
+    fn bgra(n: usize, b: u8, g: u8, r: u8) -> Vec<u8> {
+        (0..n).flat_map(|_| [b, g, r, 255]).collect()
+    }
+
+    #[test]
+    fn white_stays_white_and_is_not_inverted() {
+        let img = GrayImage::from_bgra(&bgra(4, 255, 255, 255), 2, 2, 1);
+        assert_eq!(img.data, vec![255; 4]);
+        assert_eq!((img.width, img.height, img.scale), (2, 2, 1));
+    }
+
+    #[test]
+    fn a_dark_region_is_inverted_for_tesseract() {
+        // Light text on a dark field: Tesseract 5 is markedly worse on that, so
+        // a predominantly dark region is flipped.
+        let img = GrayImage::from_bgra(&bgra(4, 0, 0, 0), 2, 2, 1);
+        assert_eq!(img.data, vec![255; 4], "black should come back as white");
+    }
+
+    /// One coloured pixel beside a white one. The white keeps the mean above the
+    /// inversion threshold, so the colour's own luma is what comes back.
+    fn luma_of(b: u8, g: u8, r: u8) -> u8 {
+        let mut px = vec![b, g, r, 255];
+        px.extend_from_slice(&[255, 255, 255, 255]);
+        GrayImage::from_bgra(&px, 2, 1, 1).data[0]
+    }
+
+    #[test]
+    fn luma_weights_green_most() {
+        // Rec. 601: 0.299 R, 0.587 G, 0.114 B.
+        assert_eq!(luma_of(0, 0, 255), 76, "red");
+        assert_eq!(luma_of(0, 255, 0), 149, "green");
+        assert_eq!(luma_of(255, 0, 0), 29, "blue");
+    }
+
+    #[test]
+    fn channel_order_is_bgra_not_rgba() {
+        // Pure red in BGRA is [0, 0, 255]. Reading it as RGBA would yield
+        // blue's weight (29) instead of red's (76).
+        assert_eq!(luma_of(0, 0, 255), 76);
+    }
+
+    #[test]
+    fn a_lone_dark_pixel_is_inverted() {
+        // Without a light neighbour the mean is the pixel itself, so red (76)
+        // reads as "dark region" and gets flipped.
+        let img = GrayImage::from_bgra(&[0, 0, 255, 255], 1, 1, 1);
+        assert_eq!(img.data[0], 255 - 76);
+    }
+
+    #[test]
+    fn upscaling_multiplies_both_dimensions() {
+        let img = GrayImage::from_bgra(&bgra(6, 255, 255, 255), 3, 2, 3);
+        assert_eq!((img.width, img.height), (9, 6));
+        assert_eq!(img.data.len(), 54);
+        assert_eq!(img.scale, 3);
+    }
+
+    #[test]
+    fn scale_zero_is_treated_as_one() {
+        let img = GrayImage::from_bgra(&bgra(4, 255, 255, 255), 2, 2, 0);
+        assert_eq!((img.width, img.height, img.scale), (2, 2, 1));
+    }
+
+    #[test]
+    fn upscaling_interpolates_between_neighbours() {
+        // A black-to-white pair, doubled: the interpolated middle must land
+        // strictly between the two endpoints rather than duplicating them.
+        let src = [255u8, 255, 255, 255, 0, 0, 0, 255]; // white then black
+        let img = GrayImage::from_bgra(&src, 2, 1, 2);
+        // Both axes scale, so a 2x1 source becomes 4x2.
+        assert_eq!((img.width, img.height), (4, 2));
+        let row = &img.data[..4];
+        assert!(row[0] > row[3], "the gradient should run from light to dark");
+        assert!(row.windows(2).all(|w| w[0] >= w[1]), "and be monotonic: {row:?}");
+    }
+
+    #[test]
+    fn a_mid_grey_region_is_left_alone() {
+        // Mean 128 is above the inversion threshold of 110.
+        let img = GrayImage::from_bgra(&bgra(4, 128, 128, 128), 2, 2, 1);
+        assert_eq!(img.data[0], 128);
+    }
+}

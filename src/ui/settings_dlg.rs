@@ -26,6 +26,7 @@ const ID_LANG: usize = 1005;
 const ID_UPSCALE: usize = 1006;
 const ID_PSM: usize = 1007;
 const ID_DEBUG: usize = 1008;
+const ID_UPDATES: usize = 1009;
 const ID_SAVE: usize = 1;
 const ID_CANCEL: usize = 2;
 const ID_DEFAULTS: usize = 1010;
@@ -312,7 +313,14 @@ fn build(hwnd: HWND, s: &Settings) -> Result<()> {
         y += row_h + px(10);
 
         // ---- diagnostics ----
-        section("Diagnostics", &mut y);
+        section("Updates and diagnostics", &mut y);
+
+        let h = add(w!("BUTTON"), "Check for updates at start-up",
+            WINDOW_STYLE(BS_AUTOCHECKBOX as u32) | WS_TABSTOP,
+            ID_UPDATES, label_x, px(420), px(24), y, font);
+        SendMessageW(h, BM_SETCHECK, Some(WPARAM(if s.check_updates { 1 } else { 0 })), None);
+        controls.push((ID_UPDATES, h));
+        y += px(26);
 
         let h = add(w!("BUTTON"), "Log every scan and its translations to the console",
             WINDOW_STYLE(BS_AUTOCHECKBOX as u32) | WS_TABSTOP,
@@ -374,12 +382,12 @@ fn build(hwnd: HWND, s: &Settings) -> Result<()> {
             rect.bottom - rect.top,
             SWP_NOMOVE | SWP_NOZORDER,
         );
-        center_on_owner(hwnd);
+        center_on_cursor_monitor(hwnd);
         Ok(())
     }
 }
 
-fn center_on_owner(hwnd: HWND) {
+pub fn center_on_cursor_monitor(hwnd: HWND) {
     unsafe {
         use windows::Win32::Foundation::RECT;
         let mut me = RECT::default();
@@ -452,6 +460,8 @@ fn collect(dlg: &Dlg) -> Settings {
     s.psm = PSMS[combo_index(dlg.get(ID_PSM)).min(PSMS.len() - 1)].0;
     s.debug_log =
         unsafe { SendMessageW(dlg.get(ID_DEBUG), BM_GETCHECK, None, None).0 == 1 };
+    s.check_updates =
+        unsafe { SendMessageW(dlg.get(ID_UPDATES), BM_GETCHECK, None, None).0 == 1 };
     s
 }
 
@@ -465,6 +475,7 @@ fn apply_to_controls(dlg: &Dlg, s: &Settings) {
         combo_select(dlg.get(ID_UPSCALE), UPSCALES.iter().position(|u| *u == s.upscale).unwrap_or(1));
         combo_select(dlg.get(ID_PSM), PSMS.iter().position(|(m, _)| *m == s.psm).unwrap_or(2));
         SendMessageW(dlg.get(ID_DEBUG), BM_SETCHECK, Some(WPARAM(if s.debug_log { 1 } else { 0 })), None);
+        SendMessageW(dlg.get(ID_UPDATES), BM_SETCHECK, Some(WPARAM(if s.check_updates { 1 } else { 0 })), None);
     }
 }
 
@@ -498,6 +509,19 @@ extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT
                     _ => {}
                 }
                 LRESULT(0)
+            }
+            // Without this the labels inherit whatever DefWindowProc hands
+            // back, which is not the dialog face colour and shows as stray
+            // colours over the window background.
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+                use windows::Win32::Graphics::Gdi::{
+                    GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor, COLOR_BTNFACE,
+                    COLOR_BTNTEXT, HDC, TRANSPARENT,
+                };
+                let dc = HDC(wp.0 as *mut _);
+                SetTextColor(dc, windows::Win32::Foundation::COLORREF(GetSysColor(COLOR_BTNTEXT)));
+                SetBkMode(dc, TRANSPARENT);
+                LRESULT(GetSysColorBrush(COLOR_BTNFACE).0 as isize)
             }
             WM_CLOSE => {
                 let _ = DestroyWindow(hwnd);

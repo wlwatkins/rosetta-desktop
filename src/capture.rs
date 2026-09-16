@@ -244,3 +244,60 @@ pub fn monitors() -> Vec<Rect> {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(data: &[u8], w: u32, h: u32) -> CapturedFrame<'_> {
+        CapturedFrame { data, width: w, height: h }
+    }
+
+    #[test]
+    fn the_same_pixels_hash_the_same() {
+        let a = vec![7u8; 4096];
+        let b = vec![7u8; 4096];
+        assert_eq!(frame(&a, 32, 32).fingerprint(), frame(&b, 32, 32).fingerprint());
+    }
+
+    #[test]
+    fn changed_pixels_change_the_hash() {
+        // This is what makes the live loop skip re-running the model.
+        let a = vec![7u8; 4096];
+        let mut b = a.clone();
+        b[0] = 8;
+        assert_ne!(frame(&a, 32, 32).fingerprint(), frame(&b, 32, 32).fingerprint());
+    }
+
+    #[test]
+    fn dimensions_are_part_of_the_hash() {
+        // Same bytes, different shape: resizing the box must force a re-scan.
+        let data = vec![7u8; 4096];
+        assert_ne!(frame(&data, 32, 32).fingerprint(), frame(&data, 16, 64).fingerprint());
+    }
+
+    #[test]
+    fn a_tiny_frame_does_not_panic() {
+        let data = vec![1u8, 2, 3, 4];
+        let _ = frame(&data, 1, 1).fingerprint();
+    }
+
+    #[test]
+    fn virtual_screen_is_not_degenerate() {
+        // A smoke test: it calls into Win32, so it mostly proves the bindings
+        // and the sign handling of a left-hand monitor are right.
+        let vs = virtual_screen();
+        assert!(vs.w > 0 && vs.h > 0, "got {vs:?}");
+    }
+
+    #[test]
+    fn every_monitor_is_inside_the_virtual_screen() {
+        let vs = virtual_screen();
+        let mons = monitors();
+        assert!(!mons.is_empty());
+        for m in &mons {
+            assert!(!m.is_empty(), "{m:?}");
+            assert!(m.intersects(&vs), "{m:?} is outside {vs:?}");
+        }
+    }
+}

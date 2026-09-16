@@ -293,9 +293,8 @@ try {
     }
     else {
         Write-Step 'Building the installer (this takes a few minutes)...'
-        $packageArgs = @()
-        if ($SkipTests) { $packageArgs += '-SkipTests' }
-        & (Join-Path $PSScriptRoot 'package.ps1') @packageArgs
+        # Named, not splatted: see the note in package.ps1.
+        & (Join-Path $PSScriptRoot 'package.ps1') -SkipTests:$SkipTests
         if ($LASTEXITCODE -ne 0) {
             Stop-WithMessage 'The build failed. Nothing has been tagged or pushed.'
         }

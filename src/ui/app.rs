@@ -24,6 +24,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use super::about_dlg::{self, WM_ABOUT_CHECK_UPDATES};
 use super::hotkey;
 use super::render::{Renderer, Rgba};
 use super::settings_dlg::{self, WM_SETTINGS_SAVED};
@@ -31,10 +32,13 @@ use crate::capture::{enable_dpi_awareness, exclude_from_capture, monitors, virtu
 use crate::clipboard;
 use crate::geom::Rect;
 use crate::settings::Settings;
+use crate::{autostart, update};
 use crate::worker::{ScanResult, Shared, Status, Worker};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_RESULT: u32 = WM_APP + 2;
+/// Posted by the background update check; wParam is 1 when one is available.
+const WM_UPDATE_READY: u32 = WM_APP + 5;
 
 const HOTKEY_ACTIVATE: i32 = 1;
 const HOTKEY_CANCEL: i32 = 2;
@@ -50,6 +54,9 @@ const IDLE_RESCAN: Duration = Duration::from_millis(450);
 const MENU_SELECT: usize = 100;
 const MENU_EXIT: usize = 101;
 const MENU_SETTINGS: usize = 102;
+const MENU_ABOUT: usize = 103;
+const MENU_UPDATES: usize = 104;
+const MENU_AUTOSTART: usize = 105;
 
 /// Slack around the region for the frame, handles, shadows and the toolbar
 /// that hangs below the selection. Too small and the toolbar gets clipped by
@@ -249,6 +256,14 @@ pub struct App {
     settings: Settings,
     models_dir: PathBuf,
     vendor_dir: PathBuf,
+    /// Set by the background check; offered from the menu and the About window.
+    available_update: Option<update::Release>,
+    checking_updates: bool,
+    /// Whether the outcome of the running check should be shown to the user;
+    /// the start-up check is silent unless it finds something.
+    announce_updates: bool,
+    /// Where the update thread leaves its result.
+    update_slot: std::sync::Arc<parking_lot::Mutex<Option<Result<update::Release, String>>>>,
 }
 
 /// Name shared with the installer's `AppMutex`, so a setup run can tell that
@@ -416,6 +431,10 @@ pub fn run(models: PathBuf, vendor: PathBuf, settings: Settings) -> Result<()> {
         settings: settings.clone(),
         models_dir: models,
         vendor_dir: vendor,
+        available_update: None,
+        checking_updates: false,
+        announce_updates: false,
+        update_slot: std::sync::Arc::new(parking_lot::Mutex::new(None)),
     });
 
     unsafe {
@@ -433,6 +452,11 @@ pub fn run(models: PathBuf, vendor: PathBuf, settings: Settings) -> Result<()> {
     }
 
     app.add_tray(app_hwnd)?;
+    if settings.check_updates {
+        // Silent unless it finds something: nobody wants a dialog at sign-in
+        // telling them nothing happened.
+        app.spawn_update_check(false);
+    }
     println!(
         "Rosetta is running in the tray. Press {} to select a region, Esc to dismiss.",
         key.label
@@ -498,6 +522,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 }
                 LRESULT(0)
             }
+            WM_ABOUT_CHECK_UPDATES => {
+                if let Some(app) = app_from(hwnd) {
+                    app.on_update_menu();
+                }
+                LRESULT(0)
+            }
+            WM_UPDATE_READY => {
+                if let Some(app) = app_from(hwnd) {
+                    app.on_update_result(wp.0 == 1);
+                }
+                LRESULT(0)
+            }
             WM_TIMER => {
                 if let Some(app) = app_from(hwnd) {
                     match wp.0 {
@@ -526,6 +562,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     match (wp.0 & 0xffff) as usize {
                         MENU_SELECT => app.begin_selection(hwnd),
                         MENU_SETTINGS => app.open_settings(),
+                        MENU_ABOUT => app.open_about(),
+                        MENU_UPDATES => app.on_update_menu(),
+                        MENU_AUTOSTART => app.toggle_autostart(),
                         MENU_EXIT => {
                             app.dismiss(hwnd);
                             PostQuitMessage(0);
@@ -620,12 +659,31 @@ impl App {
     fn show_menu(&mut self, hwnd: HWND) {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
-            let label: Vec<u16> = format!("Select region\t{}", self.hotkey_label)
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            let _ = AppendMenuW(menu, MF_STRING, MENU_SELECT, PCWSTR(label.as_ptr()));
+            let wide = |s: String| -> Vec<u16> {
+                s.encode_utf16().chain(std::iter::once(0)).collect()
+            };
+
+            // The version doubles as the About entry.
+            let version = wide(format!("Rosetta {}", update::current_version()));
+            let _ = AppendMenuW(menu, MF_STRING, MENU_ABOUT, PCWSTR(version.as_ptr()));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+            let select = wide(format!("Select region\t{}", self.hotkey_label));
+            let _ = AppendMenuW(menu, MF_STRING, MENU_SELECT, PCWSTR(select.as_ptr()));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+            let boot = wide("Start when I sign in".to_string());
+            let checked = if autostart::is_enabled() { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(menu, MF_STRING | checked, MENU_AUTOSTART, PCWSTR(boot.as_ptr()));
+
+            let updates = wide(match &self.available_update {
+                Some(r) => format!("Update to {} ...", r.version),
+                None if self.checking_updates => "Checking for updates...".to_string(),
+                None => "Check for updates...".to_string(),
+            });
+            let flags = if self.checking_updates { MF_STRING | MF_GRAYED } else { MF_STRING };
+            let _ = AppendMenuW(menu, flags, MENU_UPDATES, PCWSTR(updates.as_ptr()));
+
             let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("Settings..."));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit"));
@@ -637,6 +695,180 @@ impl App {
             let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, None, hwnd, None);
             let _ = DestroyMenu(menu);
         }
+    }
+
+    // ---------- about and updates ----------
+
+    fn open_about(&mut self) {
+        if let Err(e) = about_dlg::open(self.app_hwnd) {
+            eprintln!("[warn] could not open About: {e:#}");
+        }
+    }
+
+    fn toggle_autostart(&mut self) {
+        match autostart::toggle() {
+            Ok(on) => println!(
+                "Start at sign-in is now {}.",
+                if on { "on" } else { "off" }
+            ),
+            Err(e) => self.warn("Could not change the sign-in setting", &format!("{e:#}")),
+        }
+    }
+
+    /// Runs the check on a worker thread; the UI thread learns the outcome from
+    /// WM_UPDATE_READY.
+    fn spawn_update_check(&mut self, announce: bool) {
+        if self.checking_updates {
+            return;
+        }
+        self.checking_updates = true;
+
+        let hwnd = self.app_hwnd.0 as isize;
+        let shared = self.update_slot.clone();
+        std::thread::Builder::new()
+            .name("rosetta-update".into())
+            .spawn(move || {
+                let found = match update::check(update::current_version()) {
+                    Ok(release) => {
+                        let some = release.is_some();
+                        *shared.lock() = release.map(Ok);
+                        some
+                    }
+                    Err(e) => {
+                        *shared.lock() = Some(Err(format!("{e:#}")));
+                        false
+                    }
+                };
+                let flag = if found { 1 } else { 0 };
+                // `announce` rides along so a silent start-up check stays silent.
+                let quiet = if announce { 0 } else { 1 };
+                unsafe {
+                    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+                    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+                    let _ = PostMessageW(
+                        Some(HWND(hwnd as *mut _)),
+                        WM_UPDATE_READY,
+                        WPARAM(flag),
+                        LPARAM(quiet),
+                    );
+                }
+            })
+            .ok();
+    }
+
+    fn on_update_result(&mut self, found: bool) {
+        self.checking_updates = false;
+        let outcome = self.update_slot.lock().take();
+
+        match outcome {
+            Some(Ok(release)) => {
+                self.available_update = Some(release.clone());
+                if self.announce_updates {
+                    self.offer_update(&release);
+                }
+            }
+            Some(Err(message)) => {
+                self.available_update = None;
+                if self.announce_updates {
+                    self.warn("Could not check for updates", &message);
+                }
+            }
+            None => {
+                self.available_update = None;
+                if self.announce_updates && !found {
+                    self.info(
+                        "Rosetta is up to date",
+                        &format!("You are running {}.", update::current_version()),
+                    );
+                }
+            }
+        }
+        self.announce_updates = false;
+    }
+
+    /// Menu click: check now if nothing is pending, otherwise offer what we
+    /// already found.
+    fn on_update_menu(&mut self) {
+        self.announce_updates = true;
+        match self.available_update.clone() {
+            Some(release) => self.offer_update(&release),
+            None => self.spawn_update_check(true),
+        }
+    }
+
+    /// Asks, then downloads and installs. The installer is the same one a user
+    /// would run by hand, so an upgrade takes exactly the path a fresh install
+    /// takes: same AppId, same per-user location, old files replaced.
+    fn offer_update(&mut self, release: &update::Release) {
+        let body = format!(
+            "Rosetta {} is available. You have {}.\n\nDownload and install it now? \
+             Rosetta will close, update and start again.",
+            release.version,
+            update::current_version()
+        );
+        if !self.ask("Update available", &body) {
+            return;
+        }
+        if release.installer_url.is_none() {
+            self.warn(
+                "No installer in that release",
+                &format!("Download it yourself from {}", release.page_url),
+            );
+            return;
+        }
+
+        let installer = match update::download_installer(release) {
+            Ok(path) => path,
+            Err(e) => {
+                self.warn("Download failed", &format!("{e:#}"));
+                return;
+            }
+        };
+
+        // /SILENT shows only a progress bar, and /RELAUNCH is read by the
+        // installer's [Run] section so the app comes back afterwards.
+        let started = std::process::Command::new(&installer)
+            .args(["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/RELAUNCH"])
+            .spawn();
+
+        match started {
+            Ok(_) => {
+                // Setup cannot replace a running executable, so stand aside.
+                self.dismiss(self.app_hwnd);
+                unsafe { PostQuitMessage(0) };
+            }
+            Err(e) => self.warn(
+                "Could not start the installer",
+                &format!("{e}\n\nIt was downloaded to:\n{}", installer.display()),
+            ),
+        }
+    }
+
+    // ---------- small message boxes ----------
+
+    fn message(&self, title: &str, body: &str, style: MESSAGEBOX_STYLE) -> i32 {
+        use windows::core::HSTRING;
+        unsafe {
+            MessageBoxW(
+                None,
+                &HSTRING::from(body),
+                &HSTRING::from(title),
+                style | MB_SETFOREGROUND,
+            )
+            .0
+        }
+    }
+
+    fn info(&self, title: &str, body: &str) {
+        self.message(title, body, MB_ICONINFORMATION | MB_OK);
+    }
+
+    fn warn(&self, title: &str, body: &str) {
+        self.message(title, body, MB_ICONWARNING | MB_OK);
+    }
+
+    fn ask(&self, title: &str, body: &str) -> bool {
+        self.message(title, body, MB_ICONQUESTION | MB_YESNO) == IDYES.0
     }
 
     fn open_settings(&mut self) {
@@ -1570,5 +1802,147 @@ fn make_icon() -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
         let _ = DeleteObject(color.into());
         let _ = DeleteObject(mask.into());
         icon
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SEL: Rect = Rect { x: 200, y: 150, w: 600, h: 300 };
+
+    // ---- toolbar geometry ----
+
+    #[test]
+    fn the_toolbar_sits_below_the_selection() {
+        let tb = Toolbar::layout(SEL);
+        assert_eq!(tb.pill.y, SEL.bottom() + TB_DROP);
+        assert_eq!(tb.pill.h, PILL_H, "it shares its height with the status pill");
+    }
+
+    #[test]
+    fn the_toolbar_is_right_aligned_to_the_selection() {
+        let tb = Toolbar::layout(SEL);
+        assert_eq!(tb.pill.right(), SEL.right());
+    }
+
+    #[test]
+    fn a_narrow_selection_does_not_push_the_toolbar_off_its_left_edge() {
+        // Right-aligning a 185px toolbar to a 60px box would put it at a
+        // negative offset; it must clamp to the left edge instead.
+        let narrow = Rect::new(200, 150, 60, 40);
+        let tb = Toolbar::layout(narrow);
+        assert_eq!(tb.pill.x, narrow.x);
+    }
+
+    #[test]
+    fn the_buttons_run_in_order_without_overlapping() {
+        let tb = Toolbar::layout(SEL);
+        let order = [tb.copy_source, tb.copy_translation, tb.refresh, tb.close];
+        for pair in order.windows(2) {
+            assert!(pair[0].right() <= pair[1].x, "{:?} overlaps {:?}", pair[0], pair[1]);
+        }
+        // And all of them stay inside the pill.
+        for b in order {
+            assert!(b.x >= tb.pill.x && b.right() <= tb.pill.right(), "{b:?} escapes the pill");
+            assert!(b.y >= tb.pill.y && b.bottom() <= tb.pill.bottom(), "{b:?} escapes vertically");
+        }
+    }
+
+    #[test]
+    fn every_button_is_hit_at_its_centre() {
+        let tb = Toolbar::layout(SEL);
+        for (rect, expected) in [
+            (tb.copy_source, Button::CopySource),
+            (tb.copy_translation, Button::CopyTranslation),
+            (tb.refresh, Button::Refresh),
+            (tb.close, Button::Close),
+        ] {
+            let (cx, cy) = (rect.x + rect.w / 2, rect.y + rect.h / 2);
+            assert_eq!(tb.hit(cx, cy), Some(expected), "centre of {rect:?}");
+        }
+    }
+
+    #[test]
+    fn clicks_away_from_the_toolbar_hit_nothing() {
+        let tb = Toolbar::layout(SEL);
+        assert_eq!(tb.hit(SEL.x + 10, SEL.y + 10), None, "inside the selection");
+        assert_eq!(tb.hit(tb.pill.x - 20, tb.pill.y + 5), None, "left of the pill");
+        assert_eq!(tb.hit(tb.pill.right() + 20, tb.pill.y + 5), None, "right of the pill");
+        assert_eq!(tb.hit(tb.pill.x + 5, tb.pill.bottom() + 40), None, "below it");
+    }
+
+    #[test]
+    fn the_gaps_between_buttons_are_not_clickable() {
+        let tb = Toolbar::layout(SEL);
+        let gap_x = tb.copy_source.right() + BTN_GAP / 2;
+        let cy = tb.copy_source.y + tb.copy_source.h / 2;
+        assert_eq!(tb.hit(gap_x, cy), None);
+    }
+
+    #[test]
+    fn rect_of_agrees_with_the_layout() {
+        let tb = Toolbar::layout(SEL);
+        assert_eq!(tb.rect_of(Button::CopySource), tb.copy_source);
+        assert_eq!(tb.rect_of(Button::CopyTranslation), tb.copy_translation);
+        assert_eq!(tb.rect_of(Button::Refresh), tb.refresh);
+        assert_eq!(tb.rect_of(Button::Close), tb.close);
+    }
+
+    #[test]
+    fn the_toolbar_fits_inside_the_window_padding() {
+        // PAD is the slack the overlay window leaves around the region. If the
+        // toolbar outgrows it, the pill gets clipped -- which it once was.
+        let tb = Toolbar::layout(SEL);
+        let overhang = tb.pill.bottom() - SEL.bottom();
+        assert!(overhang <= PAD, "toolbar needs {overhang}px below but PAD is {PAD}");
+    }
+
+    // ---- drag resize ----
+
+    #[test]
+    fn moving_translates_without_resizing() {
+        let r = resize(SEL, Handle::Move, 25, -40);
+        assert_eq!(r, Rect::new(SEL.x + 25, SEL.y - 40, SEL.w, SEL.h));
+    }
+
+    #[test]
+    fn each_edge_moves_only_its_own_side() {
+        assert_eq!(resize(SEL, Handle::E, 30, 99), Rect::new(200, 150, 630, 300));
+        assert_eq!(resize(SEL, Handle::S, 99, 30), Rect::new(200, 150, 600, 330));
+        // Dragging the west edge moves x and shrinks w by the same amount.
+        assert_eq!(resize(SEL, Handle::W, 30, 99), Rect::new(230, 150, 570, 300));
+        assert_eq!(resize(SEL, Handle::N, 99, 30), Rect::new(200, 180, 600, 270));
+    }
+
+    #[test]
+    fn corners_move_both_sides() {
+        assert_eq!(resize(SEL, Handle::Se, 10, 20), Rect::new(200, 150, 610, 320));
+        assert_eq!(resize(SEL, Handle::Nw, 10, 20), Rect::new(210, 170, 590, 280));
+        assert_eq!(resize(SEL, Handle::Ne, 10, 20), Rect::new(200, 170, 610, 280));
+        assert_eq!(resize(SEL, Handle::Sw, 10, 20), Rect::new(210, 150, 590, 320));
+    }
+
+    #[test]
+    fn a_region_cannot_be_dragged_smaller_than_the_minimum() {
+        // Drag the east edge far past the west one.
+        let r = resize(SEL, Handle::E, -10_000, 0);
+        assert_eq!(r.w, MIN_REGION);
+        let r = resize(SEL, Handle::S, 0, -10_000);
+        assert_eq!(r.h, MIN_REGION);
+    }
+
+    #[test]
+    fn handle_none_is_a_no_op() {
+        assert_eq!(resize(SEL, Handle::None, 50, 50), SEL);
+    }
+
+    // ---- theme ----
+
+    #[test]
+    fn theme_lookup_falls_back_to_dark() {
+        assert_eq!(theme_for("light").shadow, LIGHT.shadow);
+        assert_eq!(theme_for("dark").shadow, DARK.shadow);
+        assert_eq!(theme_for("chartreuse").shadow, DARK.shadow, "unknown names are dark");
     }
 }

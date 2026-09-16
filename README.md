@@ -64,13 +64,21 @@ model — runs on your machine.
   pipeline depends on rebuilds it in place rather than asking you to restart.
 - **A real installer.** Per-user, no admin prompt, Start menu entries, optional
   run-at-sign-in, and an uninstaller that removes everything it wrote.
+- **Updates itself.** It can check GitHub for a newer release, then download and
+  install it and start itself again, all from the tray menu. Off in one click if
+  you would rather it did not.
 
 ### Private by construction
 
-There is no server, no telemetry and no account. Nothing leaves your machine at
-any point, and the app makes no network requests at all — not even an update
-check. The only downloads happen once, during setup, when the model and
-Tesseract are fetched.
+There is no server, no telemetry and no account. **Nothing you capture,
+recognise or translate ever leaves your machine** — the screen never goes
+anywhere, and the model runs locally.
+
+The app makes exactly one kind of network request, and only if you leave it on:
+an unauthenticated `GET` to GitHub's releases API to see whether a newer version
+exists, at start-up and when you ask. It sends no identifiers beyond the
+inevitable user agent and IP address. Turn it off with **Check for updates at
+start-up** in Settings, and nothing reaches the network at all.
 
 ## Installing it
 
@@ -91,7 +99,11 @@ Once it is running the tray icon is all you see:
 | drag | pick the region; release to translate |
 | drag inside, or on an edge | move or resize, re-translating as you go |
 | `Esc` | dismiss the overlay |
-| right-click the tray icon | menu, including **Settings** |
+| right-click the tray icon | the menu below |
+
+The tray menu carries the version at the top — click it for **About** — then the
+region picker, a **Start when I sign in** tick, **Check for updates**, and
+**Settings**.
 
 ## Building it yourself
 
@@ -133,9 +145,29 @@ shortcut ever collides with something else and the app will not start.
 </div>
 
 Settings are stored in `%APPDATA%\Rosetta\settings.json`. Saving applies the
-theme, shortcut and logging immediately; changing the backend, beam width, OCR
-language, upscale or page segmentation rebuilds the translation pipeline in
-place, which takes about a second.
+theme, shortcut, update check and logging immediately; changing the backend,
+beam width, OCR language, upscale or page segmentation rebuilds the translation
+pipeline in place, which takes about a second.
+
+"Start when I sign in" lives in the tray menu rather than here, because it is a
+Windows setting (a per-user `Run` entry) rather than one of Rosetta's own. The
+installer writes the same value if you tick the box during setup.
+
+### Updating
+
+Rosetta asks GitHub for the latest release at start-up, and says nothing unless
+there is one. When there is, or when you pick **Check for updates** yourself, it
+offers to do the whole thing: download the installer, run it silently, and start
+the new version. Because the installer carries the same `AppId`, that is an
+upgrade in place rather than a second copy — the old files are replaced and the
+uninstaller is updated.
+
+Nothing downloads until you say yes, and nothing installs behind your back.
+
+```
+rosetta-desktop.exe check-updates    ask from the command line
+rosetta-desktop.exe about            the About window on its own
+```
 
 ### Environment overrides
 
@@ -159,6 +191,7 @@ run.cmd run -Hotkey ctrl+shift+t -Theme light -Log
 | `ROSETTA_LANG` | `heb` | Tesseract language |
 | `ROSETTA_UPSCALE` | `2` | how much to upscale before OCR |
 | `ROSETTA_PSM` | `6` | Tesseract page-segmentation mode |
+| `ROSETTA_REPO` | `wlwatkins/rosetta-desktop` | which repository to check for updates |
 | `ROSETTA_DEBUG` | off | log every scan and its translations |
 | `ROSETTA_NO_EXCLUDE` | off | let the overlay appear in screenshots (debug only) |
 
@@ -186,7 +219,10 @@ src/
   translate/    Marian encoder/decoder on ONNX Runtime, beam search
   stabilize.rs  temporal smoothing of OCR results
   worker.rs     capture -> OCR -> translate, off the UI thread
-  ui/           tray, hotkeys, selection overlay, Direct2D rendering
+  settings.rs   persisted configuration, with environment overrides
+  update.rs     GitHub release checking and installer download
+  autostart.rs  the per-user Run entry behind "start when I sign in"
+  ui/           tray, hotkeys, overlay, settings and about windows
 ```
 
 Three details carry most of the design.
@@ -273,6 +309,21 @@ Only source and configuration are tracked. Everything heavy is generated:
 
 `models_fp32/` exists only so `bench` can compare precisions; without it those
 rows are skipped.
+
+## Tests
+
+```
+run.cmd build          runs them, then builds
+cargo test --release   on their own
+```
+
+92 of them, covering the parts where a mistake is quiet rather than loud:
+rectangle maths and IoU matching, the stabilizer's hold-and-retire behaviour
+(including the flicker case, where a scan finds nothing and the overlay must not
+blank), settings clamping and environment precedence, grayscale conversion and
+the dark-region inversion, capture fingerprinting, toolbar hit-testing and
+drag-resize geometry, hotkey parsing, version comparison and release parsing,
+and a round-trip through the real `Run` registry key under a test-only name.
 
 ## Known limitations
 

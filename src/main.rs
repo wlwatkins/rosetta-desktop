@@ -1,3 +1,4 @@
+mod autostart;
 mod capture;
 mod clipboard;
 mod geom;
@@ -7,6 +8,7 @@ mod settings;
 mod stabilize;
 mod translate;
 mod ui;
+mod update;
 mod worker;
 
 use anyhow::{bail, Context, Result};
@@ -34,6 +36,8 @@ fn main() -> Result<()> {
         Some("pipeline") => cmd_pipeline(&args[1..]),
         Some("grab") => cmd_grab(&args[1..]),
         Some("settings") => cmd_settings(),
+        Some("about") => ui::run_about(),
+        Some("check-updates") => cmd_check_updates(),
         None | Some("run") => cmd_run(),
         other => bail!(
             "unknown command {other:?}; try:\n  \
@@ -161,6 +165,25 @@ fn cmd_pipeline(rest: &[String]) -> Result<()> {
         println!("\n  box ({},{} {}x{}) conf {:.1}", l.rect.x, l.rect.y, l.rect.w, l.rect.h, l.confidence);
         println!("  HE  {}", l.text);
         println!("  EN  {en}");
+    }
+    Ok(())
+}
+
+/// Ask GitHub whether there is a newer release, and say so.
+fn cmd_check_updates() -> Result<()> {
+    let current = update::current_version();
+    println!("running {current}, checking {} ...", update::repo());
+    match update::check(current)? {
+        Some(r) => {
+            println!("update available: {} ({})", r.version, r.tag);
+            println!("  {}", r.page_url);
+            match (&r.installer_name, &r.installer_url) {
+                (Some(n), Some(u)) => println!("  installer: {n}
+  {u}"),
+                _ => println!("  (no installer attached to that release)"),
+            }
+        }
+        None => println!("up to date"),
     }
     Ok(())
 }

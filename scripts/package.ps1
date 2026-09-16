@@ -57,9 +57,9 @@ if ($SkipBuild) {
     Write-Warn 'Skipping the build (-SkipBuild).'
 }
 else {
-    $buildArgs = @()
-    if ($SkipTests) { $buildArgs += '-SkipTests' }
-    & (Join-Path $PSScriptRoot 'build.ps1') @buildArgs
+    # Named, not splatted: passing an array to a .ps1 binds positionally, and
+    # build.ps1 has no positional parameters for a switch to land on.
+    & (Join-Path $PSScriptRoot 'build.ps1') -SkipTests:$SkipTests
     if ($LASTEXITCODE -ne 0) {
         Stop-WithMessage 'The build failed; nothing has been packaged.'
     }
@@ -107,13 +107,14 @@ Rosetta has no window: it sits in the notification area.
   Ctrl+Alt+T          select a region to translate
   Esc                 dismiss the overlay
   double-click tray   select a region
-  right-click tray    menu, including Settings
+  right-click tray    menu: About, start at sign-in, updates, Settings
 
 Under the selection there is a toolbar: copy the recognised Hebrew, copy the
 English, force a re-scan, or close.
 
-Everything runs locally. Nothing is sent anywhere and no network request is
-ever made.
+Nothing you capture, recognise or translate leaves this machine. The only
+network request Rosetta makes is an update check against GitHub, which you can
+turn off in Settings.
 
 Settings are stored in %APPDATA%\Rosetta\settings.json and can be changed from
 the tray menu, or by running:  rosetta-desktop.exe settings

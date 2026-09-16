@@ -29,6 +29,9 @@ pub struct Settings {
     pub psm: i32,
     /// Log every scan and its translations to the console.
     pub debug_log: bool,
+    /// Ask GitHub for a newer release at start-up. The only network access the
+    /// app ever makes, so it is a setting rather than a given.
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
@@ -42,6 +45,7 @@ impl Default for Settings {
             upscale: 2,
             psm: 6,
             debug_log: false,
+            check_updates: true,
         }
     }
 }
@@ -162,5 +166,155 @@ impl Settings {
             || self.lang != other.lang
             || self.upscale != other.upscale
             || self.psm != other.psm
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned()
+    }
+
+    #[test]
+    fn defaults_are_the_documented_ones() {
+        let s = Settings::default();
+        assert_eq!(s.hotkey, "ctrl+alt+t");
+        assert_eq!(s.theme, "dark");
+        assert_eq!(s.beams, 4);
+        assert_eq!(s.backend, "cpu");
+        assert_eq!(s.lang, "heb");
+        assert_eq!(s.upscale, 2);
+        assert_eq!(s.psm, 6);
+        assert!(!s.debug_log);
+    }
+
+    #[test]
+    fn json_round_trips() {
+        let s = Settings { beams: 8, theme: "light".into(), ..Settings::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn a_partial_file_keeps_the_defaults_for_the_rest() {
+        // serde(default) is what lets an old settings.json survive a new field.
+        let s: Settings = serde_json::from_str(r#"{"beams": 1}"#).unwrap();
+        assert_eq!(s.beams, 1);
+        assert_eq!(s.theme, "dark");
+        assert_eq!(s.hotkey, "ctrl+alt+t");
+    }
+
+    #[test]
+    fn an_unknown_field_is_ignored_rather_than_fatal() {
+        let s: Settings = serde_json::from_str(r#"{"beams": 2, "from_the_future": true}"#).unwrap();
+        assert_eq!(s.beams, 2);
+    }
+
+    #[test]
+    fn clamp_rejects_nonsense_from_a_hand_edited_file() {
+        let mut s = Settings {
+            beams: 999,
+            upscale: 0,
+            psm: 42,
+            theme: "chartreuse".into(),
+            backend: "quantum".into(),
+            lang: "   ".into(),
+            ..Settings::default()
+        };
+        s.clamp();
+        assert_eq!(s.beams, 12);
+        assert_eq!(s.upscale, 1);
+        assert_eq!(s.psm, 6, "an unsupported mode falls back to single block");
+        assert_eq!(s.theme, "dark");
+        assert_eq!(s.backend, "cpu");
+        assert_eq!(s.lang, "heb");
+    }
+
+    #[test]
+    fn env_overrides_win_and_are_reported() {
+        let mut s = Settings::default();
+        let over = s.apply_overrides(env(&[
+            ("ROSETTA_THEME", "light"),
+            ("ROSETTA_BEAMS", "1"),
+            ("ROSETTA_DEBUG", "1"),
+        ]));
+        assert_eq!(s.theme, "light");
+        assert_eq!(s.beams, 1);
+        assert!(s.debug_log);
+        assert_eq!(over.0, vec!["theme", "beams", "debug_log"]);
+    }
+
+    #[test]
+    fn no_env_means_no_overrides() {
+        let mut s = Settings::default();
+        let over = s.apply_overrides(env(&[]));
+        assert!(over.is_empty());
+        assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn an_unparseable_numeric_override_is_ignored() {
+        let mut s = Settings::default();
+        let over = s.apply_overrides(env(&[("ROSETTA_BEAMS", "lots")]));
+        assert_eq!(s.beams, 4, "the default must survive a bad value");
+        assert!(over.is_empty());
+    }
+
+    #[test]
+    fn overrides_are_clamped_too() {
+        let mut s = Settings::default();
+        s.apply_overrides(env(&[("ROSETTA_BACKEND", "nonsense"), ("ROSETTA_PSM", "99")]));
+        assert_eq!(s.backend, "cpu");
+        assert_eq!(s.psm, 6);
+    }
+
+    #[test]
+    fn debug_flag_is_set_by_presence_not_value() {
+        let mut s = Settings::default();
+        s.apply_overrides(env(&[("ROSETTA_DEBUG", "0")]));
+        assert!(s.debug_log, "ROSETTA_DEBUG=0 still counts as set, like the shell idiom");
+    }
+
+    #[test]
+    fn translate_config_maps_backend_and_beams() {
+        let s = Settings { backend: "dml".into(), beams: 6, ..Settings::default() };
+        let cfg = s.translate_config();
+        assert_eq!(cfg.backend, Backend::DirectMl);
+        assert_eq!(cfg.beams, 6);
+
+        let cfg = Settings { backend: "cuda".into(), ..Settings::default() }.translate_config();
+        assert_eq!(cfg.backend, Backend::Cuda);
+    }
+
+    #[test]
+    fn pipeline_differs_only_for_pipeline_fields() {
+        let base = Settings::default();
+
+        // Cosmetic changes must not tear down the worker.
+        for cosmetic in [
+            Settings { theme: "light".into(), ..base.clone() },
+            Settings { hotkey: "ctrl+shift+t".into(), ..base.clone() },
+            Settings { debug_log: true, ..base.clone() },
+        ] {
+            assert!(!base.pipeline_differs(&cosmetic), "{cosmetic:?} should not restart it");
+        }
+
+        // These each need the model or OCR engine rebuilt.
+        for heavy in [
+            Settings { beams: 1, ..base.clone() },
+            Settings { backend: "dml".into(), ..base.clone() },
+            Settings { lang: "eng".into(), ..base.clone() },
+            Settings { upscale: 3, ..base.clone() },
+            Settings { psm: 11, ..base.clone() },
+        ] {
+            assert!(base.pipeline_differs(&heavy), "{heavy:?} should restart it");
+        }
     }
 }

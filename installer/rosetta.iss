@@ -79,10 +79,17 @@ Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreve
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
 Name: "{group}\{#AppName} Settings"; Filename: "{app}\{#AppExe}"; Parameters: "settings"; Comment: "Change the shortcut, theme and recognition options"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
-Name: "{userstartup}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: startupicon
+
+[Registry]
+; The same value the app's "Start when I sign in" menu item toggles. One
+; mechanism, so a Startup shortcut and a Run entry cannot both fire.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExe}"""; Flags: uninsdeletevalue; Tasks: startupicon
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Start {#AppName} now"; Flags: nowait postinstall skipifsilent
+; The in-app updater runs setup silently and passes /RELAUNCH, so the app comes
+; back by itself; a silent run skips the postinstall entry above.
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: WantsRelaunch
 
 [UninstallDelete]
 ; ONNX Runtime unpacks next to the binary on first use.
@@ -91,6 +98,20 @@ Type: filesandordirs; Name: "{app}\vendor"
 Type: dirifempty; Name: "{app}"
 
 [Code]
+// True when the in-app updater started us, rather than a person.
+function WantsRelaunch: Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/RELAUNCH') = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
 // Settings live outside {app}, so they survive an uninstall unless asked for.
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
