@@ -93,8 +93,7 @@ if ($shown.Count) { Write-Step ($shown -join '   ') }
 Write-Step 'Closing this window stops the app. Ctrl+C also works.'
 Write-Host ''
 
-& $exe
-$code = $LASTEXITCODE
+$code = Invoke-App -Exe $exe
 
 Write-Host ''
 if ($code -and $code -ne 0) {

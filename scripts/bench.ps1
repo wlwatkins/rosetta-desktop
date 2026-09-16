@@ -52,8 +52,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $Root 'models_fp32\model_meta.json')
 }
 
 $env:ROSETTA_BACKEND = $Backend
-& $exe bench
-$code = $LASTEXITCODE
+$code = Invoke-App -Exe $exe -Arguments @('bench')
 
 Write-Host ''
 if ($code -and $code -ne 0) {

@@ -1,6 +1,14 @@
+//! Rosetta: Hebrew-to-English screen translation.
+//!
+//! Linked as a GUI application so the tray app never opens a terminal, and so
+//! closing a terminal cannot kill it. `console::attach_to_parent` gives the
+//! command-line subcommands their output back when one is available.
+#![windows_subsystem = "windows"]
+
 mod autostart;
 mod capture;
 mod clipboard;
+mod console;
 mod geom;
 mod ocr;
 mod paths;
@@ -27,7 +35,16 @@ const PROBES: &[&str] = &[
     "למרות שהגשם לא הפסיק כל הלילה, הם החליטו לצאת לטיול בהרים עם עלות השחר.",
 ];
 
-fn main() -> Result<()> {
+fn main() {
+    // Before anything prints: Rust caches the standard handles on first use.
+    let has_console = console::attach_to_parent();
+    if let Err(e) = run() {
+        console::report_fatal(has_console, &e);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("translate") => cmd_translate(&args[1..]),

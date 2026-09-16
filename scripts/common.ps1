@@ -208,5 +208,31 @@ function Set-ProjectVersion {
         else { $line }
     }
     if (-not $done) { Stop-WithMessage 'Could not find the version line in Cargo.toml' }
-    Set-Content -LiteralPath $manifest -Value $out -Encoding UTF8
+    # Not Set-Content -Encoding UTF8: on PowerShell 5.1 that writes a BOM, which
+    # would land in Cargo.toml on every release.
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllLines($manifest, $out, $utf8NoBom)
+}
+
+<#
+    Runs the app and waits for it.
+
+    The binary is linked as a GUI application, so no terminal appears when it is
+    launched from the Start menu. PowerShell does not wait for those, and `&`
+    would return instantly while the tray app was still running. Start-Process
+    with -NoNewWindow keeps the inherited console -- so the app's own output
+    still lands here -- and -PassThru gives something to wait on.
+
+    Returns the exit code.
+#>
+function Invoke-App {
+    param(
+        [Parameter(Mandatory)] [string]$Exe,
+        [string[]]$Arguments = @()
+    )
+    $start = @{ FilePath = $Exe; PassThru = $true; NoNewWindow = $true }
+    if ($Arguments.Count) { $start.ArgumentList = $Arguments }
+    $proc = Start-Process @start
+    $proc.WaitForExit()
+    return $proc.ExitCode
 }
