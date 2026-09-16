@@ -1,0 +1,23 @@
+# Rust build output
+/target
+
+# Model artifacts: regenerate with tools/setup_model.sh
+/models
+/models_fp32
+
+# Vendored Tesseract runtime: regenerate with tools/vendor_tesseract.sh
+/vendor
+
+# Build-time-only Python venv for the model export
+/.venv-export
+
+# Never commit weights, whatever the layout
+*.onnx
+*.onnx_data
+*.traineddata
+*.safetensors
+
+# Editor / tooling local state
+/.serena/project.local.yml
+.vscode/
+.idea/
