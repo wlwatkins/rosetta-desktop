@@ -271,6 +271,9 @@ if ($DryRun) {
     exit 0
 }
 
+$lockPath = Join-Path $Root 'Cargo.lock'
+$lockBefore = if (Test-Path -LiteralPath $lockPath) { Get-Content -Raw -LiteralPath $lockPath } else { $null }
+
 $bumped = $false
 try {
     if ($target -ne $current) {
@@ -279,9 +282,15 @@ try {
         $bumped = $true
         # Keep Cargo.lock in step; the build would do it anyway, but the lock
         # belongs in the same commit as the manifest.
-        Invoke-Checked 'Updating Cargo.lock...' {
-            cargo update --offline --package rosetta-desktop 2>&1 | Out-Null
-            $global:LASTEXITCODE = 0
+        #
+        # Through Invoke-Quiet, not Invoke-Checked: cargo reports ordinary
+        # progress ("Locking 1 package...") on stderr, and merging that into the
+        # pipeline while ErrorActionPreference is Stop turns a successful run
+        # into a terminating NativeCommandError.
+        Write-Step 'Updating Cargo.lock...'
+        $lock = Invoke-Quiet -Exe 'cargo' -Arguments @('update', '--offline', '--package', 'rosetta-desktop')
+        if (-not $lock.Ok) {
+            Write-Warn 'Could not refresh Cargo.lock here; the build will do it.'
         }
     }
 
@@ -304,18 +313,16 @@ try {
         Stop-WithMessage "Expected $installer but it is not there."
     }
 
-    Invoke-Checked "Committing as '$commitMessage'..." {
-        git add -A
-        if ($LASTEXITCODE -ne 0) { return }
-        # An already-clean tree at the right version is fine: tag what is there.
-        git diff --cached --quiet
-        if ($LASTEXITCODE -ne 0) {
-            git commit -m $commitMessage
-        }
-        else {
-            Write-Step 'Nothing to commit; tagging the current commit.'
-            $global:LASTEXITCODE = 0
-        }
+    Invoke-Checked 'Staging everything...' { git add -A }
+
+    # Exit code 1 means "there are staged changes", which is the normal case
+    # here, so it must not be read as a failure.
+    $staged = Invoke-Quiet -Exe 'git' -Arguments @('diff', '--cached', '--quiet')
+    if ($staged.Ok) {
+        Write-Step 'Nothing to commit; tagging the current commit.'
+    }
+    else {
+        Invoke-Checked "Committing as '$commitMessage'..." { git commit -m $commitMessage }
     }
 
     Invoke-Checked "Tagging $tag..." { git tag -a $tag -m "Rosetta $tag" }
@@ -330,6 +337,10 @@ finally {
     if ($bumped) {
         Write-Warn "Rolling the version back to $current."
         Set-ProjectVersion -Root $Root -Version $current
+        # The lock may already carry the new version, so put it back too.
+        if ($null -ne $lockBefore) {
+            Set-Content -LiteralPath $lockPath -Value $lockBefore -NoNewline
+        }
     }
 }
 
