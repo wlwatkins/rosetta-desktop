@@ -3,6 +3,7 @@ mod clipboard;
 mod geom;
 mod ocr;
 mod paths;
+mod settings;
 mod stabilize;
 mod translate;
 mod ui;
@@ -32,6 +33,7 @@ fn main() -> Result<()> {
         Some("ocr") => cmd_ocr(&args[1..]),
         Some("pipeline") => cmd_pipeline(&args[1..]),
         Some("grab") => cmd_grab(&args[1..]),
+        Some("settings") => cmd_settings(),
         None | Some("run") => cmd_run(),
         other => bail!(
             "unknown command {other:?}; try:\n  \
@@ -163,10 +165,18 @@ fn cmd_pipeline(rest: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Open just the settings window.
+fn cmd_settings() -> Result<()> {
+    ui::run_settings(&paths::vendor_dir()?)?;
+    println!("Settings saved to {}", settings::Settings::path()?.display());
+    println!("A running copy of Rosetta picks them up when you press Save; otherwise they apply at next start.");
+    Ok(())
+}
+
 /// Launch the tray app.
 fn cmd_run() -> Result<()> {
-    let lang = std::env::var("ROSETTA_LANG").unwrap_or_else(|_| "heb".to_string());
-    ui::run(models_dir()?, paths::vendor_dir()?, env_cfg(), lang)
+    let (settings, _) = settings::Settings::load();
+    ui::run(models_dir()?, paths::vendor_dir()?, settings)
 }
 
 /// Capture a screen region and run the whole pipeline over it, optionally

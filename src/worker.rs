@@ -72,6 +72,8 @@ impl Worker {
         vendor: PathBuf,
         cfg: Config,
         lang: String,
+        upscale: u32,
+        psm: i32,
     ) -> Self {
         // Depth 1: while a scan runs, only the newest pending request matters.
         let (tx, rx) = bounded::<Job>(1);
@@ -81,8 +83,10 @@ impl Worker {
         let join = std::thread::Builder::new()
             .name("rosetta-pipeline".into())
             .spawn(move || {
-                if let Err(e) = run(notify_hwnd, notify_msg, models, vendor, cfg, lang, rx, &worker_shared)
-                {
+                if let Err(e) = run(
+                    notify_hwnd, notify_msg, models, vendor, cfg, lang, upscale, psm, rx,
+                    &worker_shared,
+                ) {
                     worker_shared.lock().status = Status::Failed(format!("{e:#}"));
                     notify(notify_hwnd, notify_msg);
                 }
@@ -130,11 +134,15 @@ fn run(
     vendor: PathBuf,
     cfg: Config,
     lang: String,
+    upscale: u32,
+    psm: i32,
     rx: Receiver<Job>,
     shared: &Shared,
 ) -> Result<()> {
     let mut capture = ScreenCapture::new()?;
     let mut ocr = OcrEngine::new(&vendor.join("bin"), &vendor.join("tessdata"), &lang)?;
+    ocr.upscale = upscale.max(1);
+    ocr.psm = psm;
     let mut mt = Marian::load(&models, cfg)?;
 
     shared.lock().status = Status::Ready;

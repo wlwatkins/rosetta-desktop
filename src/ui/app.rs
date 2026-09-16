@@ -26,10 +26,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::hotkey;
 use super::render::{Renderer, Rgba};
+use super::settings_dlg::{self, WM_SETTINGS_SAVED};
 use crate::capture::{enable_dpi_awareness, exclude_from_capture, monitors, virtual_screen};
 use crate::clipboard;
 use crate::geom::Rect;
-use crate::translate::Config;
+use crate::settings::Settings;
 use crate::worker::{ScanResult, Shared, Status, Worker};
 
 const WM_TRAY: u32 = WM_APP + 1;
@@ -48,6 +49,7 @@ const IDLE_RESCAN: Duration = Duration::from_millis(450);
 
 const MENU_SELECT: usize = 100;
 const MENU_EXIT: usize = 101;
+const MENU_SETTINGS: usize = 102;
 
 /// Slack around the region for the frame, handles, shadows and the toolbar
 /// that hangs below the selection. Too small and the toolbar gets clipped by
@@ -113,6 +115,14 @@ const LIGHT: Theme = Theme {
     handle_fill: Rgba::hex(0xFFFFFF, 1.0),
     shadow: 0.20,
 };
+
+fn theme_for(name: &str) -> Theme {
+    if name == "light" {
+        LIGHT
+    } else {
+        DARK
+    }
+}
 
 const RADIUS: f32 = 7.0;
 const CHIP_RADIUS: f32 = 5.0;
@@ -236,9 +246,51 @@ pub struct App {
     spinning: bool,
     /// Per-monitor bounds, refreshed each time the picker opens.
     monitors: Vec<Rect>,
+    settings: Settings,
+    models_dir: PathBuf,
+    vendor_dir: PathBuf,
 }
 
-pub fn run(models: PathBuf, vendor: PathBuf, cfg: Config, lang: String) -> Result<()> {
+/// Name shared with the installer's `AppMutex`, so a setup run can tell that
+/// the app is still open and ask for it to be closed before overwriting it.
+pub const SINGLE_INSTANCE_MUTEX: &str = "RosettaDesktopSingleInstance";
+
+/// Holds the single-instance mutex for the lifetime of the process.
+struct InstanceLock(windows::Win32::Foundation::HANDLE);
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// `Ok(None)` when another copy already owns the mutex.
+fn acquire_single_instance() -> Result<Option<InstanceLock>> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    unsafe {
+        let name = HSTRING::from(SINGLE_INSTANCE_MUTEX);
+        let handle = CreateMutexW(None, false, &name)?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+            return Ok(None);
+        }
+        Ok(Some(InstanceLock(handle)))
+    }
+}
+
+pub fn run(models: PathBuf, vendor: PathBuf, settings: Settings) -> Result<()> {
+    // Without this a second launch dies on RegisterHotKey with a confusing
+    // "already taken" error, and an installer has no way to know we are open.
+    let Some(_instance) = acquire_single_instance()? else {
+        println!("Rosetta is already running - look for it in the notification area.");
+        return Ok(());
+    };
+
     enable_dpi_awareness();
     unsafe {
         let _ = windows::Win32::System::Com::CoInitializeEx(
@@ -322,18 +374,19 @@ pub fn run(models: PathBuf, vendor: PathBuf, cfg: Config, lang: String) -> Resul
     let worker = Worker::spawn(
         app_hwnd.0 as isize,
         WM_RESULT,
-        models,
-        vendor,
-        cfg,
-        lang,
+        models.clone(),
+        vendor.clone(),
+        settings.translate_config(),
+        settings.lang.clone(),
+        settings.upscale,
+        settings.psm,
     );
     let shared = worker.shared.clone();
 
     // Configurable so the default never has to fight an app the user cares
     // about; Ctrl+Shift+T in particular is "reopen closed tab" in most browsers.
-    let spec = std::env::var("ROSETTA_HOTKEY").unwrap_or_else(|_| "ctrl+alt+t".to_string());
-    let key = hotkey::parse(&spec)
-        .with_context(|| format!("ROSETTA_HOTKEY={spec:?}"))?;
+    let key = hotkey::parse(&settings.hotkey)
+        .with_context(|| format!("hotkey {:?}", settings.hotkey))?;
 
     let mut app = Box::new(App {
         app_hwnd,
@@ -352,10 +405,7 @@ pub fn run(models: PathBuf, vendor: PathBuf, cfg: Config, lang: String) -> Resul
         hover: Handle::None,
         tray_added: false,
         capturing: false,
-        theme: match std::env::var("ROSETTA_THEME").as_deref() {
-            Ok("light") => LIGHT,
-            _ => DARK,
-        },
+        theme: theme_for(&settings.theme),
         hotkey_label: key.label.clone(),
         hover_btn: None,
         pressed_btn: None,
@@ -363,6 +413,9 @@ pub fn run(models: PathBuf, vendor: PathBuf, cfg: Config, lang: String) -> Resul
         spin_phase: 0,
         spinning: false,
         monitors: monitors(),
+        settings: settings.clone(),
+        models_dir: models,
+        vendor_dir: vendor,
     });
 
     unsafe {
@@ -439,6 +492,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 }
                 LRESULT(0)
             }
+            WM_SETTINGS_SAVED => {
+                if let Some(app) = app_from(hwnd) {
+                    app.reload_settings();
+                }
+                LRESULT(0)
+            }
             WM_TIMER => {
                 if let Some(app) = app_from(hwnd) {
                     match wp.0 {
@@ -453,7 +512,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 let event = (lp.0 & 0xffff) as u32;
                 if let Some(app) = app_from(hwnd) {
                     match event {
-                        WM_LBUTTONUP => app.begin_selection(hwnd),
+                        // Double-click, not single: a stray click on the tray
+                        // should not dim the screen.
+                        WM_LBUTTONDBLCLK => app.begin_selection(hwnd),
                         WM_RBUTTONUP => app.show_menu(hwnd),
                         _ => {}
                     }
@@ -464,6 +525,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 if let Some(app) = app_from(hwnd) {
                     match (wp.0 & 0xffff) as usize {
                         MENU_SELECT => app.begin_selection(hwnd),
+                        MENU_SETTINGS => app.open_settings(),
                         MENU_EXIT => {
                             app.dismiss(hwnd);
                             PostQuitMessage(0);
@@ -564,6 +626,8 @@ impl App {
                 .collect();
             let _ = AppendMenuW(menu, MF_STRING, MENU_SELECT, PCWSTR(label.as_ptr()));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("Settings..."));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit"));
 
             let mut pt = POINT::default();
@@ -573,6 +637,72 @@ impl App {
             let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, None, hwnd, None);
             let _ = DestroyMenu(menu);
         }
+    }
+
+    fn open_settings(&mut self) {
+        let (current, over) = Settings::load();
+        let tessdata = self.vendor_dir.join("tessdata");
+        if let Err(e) = settings_dlg::open(self.app_hwnd, &current, &over, &tessdata) {
+            eprintln!("[warn] could not open settings: {e:#}");
+        }
+    }
+
+    /// Re-read the file the settings window just wrote and apply what changed.
+    fn reload_settings(&mut self) {
+        let (next, _) = Settings::load();
+        let previous = std::mem::replace(&mut self.settings, next.clone());
+
+        self.theme = theme_for(&next.theme);
+
+        // The worker reads this per scan, so toggling it needs no restart.
+        if next.debug_log {
+            std::env::set_var("ROSETTA_DEBUG", "1");
+        } else {
+            std::env::remove_var("ROSETTA_DEBUG");
+        }
+
+        if next.hotkey != previous.hotkey {
+            match hotkey::parse(&next.hotkey) {
+                Ok(key) => unsafe {
+                    let _ = UnregisterHotKey(Some(self.app_hwnd), HOTKEY_ACTIVATE);
+                    if RegisterHotKey(Some(self.app_hwnd), HOTKEY_ACTIVATE, key.mods, key.vk).is_ok() {
+                        self.hotkey_label = key.label;
+                    } else {
+                        eprintln!("[warn] {} is taken; keeping the previous shortcut", key.label);
+                        if let Ok(old) = hotkey::parse(&previous.hotkey) {
+                            let _ = RegisterHotKey(Some(self.app_hwnd), HOTKEY_ACTIVATE, old.mods, old.vk);
+                        }
+                    }
+                },
+                Err(e) => eprintln!("[warn] {e:#}"),
+            }
+            self.remove_tray(self.app_hwnd);
+            let _ = self.add_tray(self.app_hwnd);
+        }
+
+        // Model and OCR settings live inside the worker, so they need it rebuilt.
+        if next.pipeline_differs(&previous) {
+            self.worker.quit();
+            self.worker = Worker::spawn(
+                self.app_hwnd.0 as isize,
+                WM_RESULT,
+                self.models_dir.clone(),
+                self.vendor_dir.clone(),
+                next.translate_config(),
+                next.lang.clone(),
+                next.upscale,
+                next.psm,
+            );
+            self.shared = self.worker.shared.clone();
+            self.result = None;
+            self.last_requested = Rect::default();
+            self.last_request_at = None;
+            if self.mode == Mode::Live {
+                self.request_scan(true, true);
+            }
+        }
+
+        let _ = self.redraw();
     }
 
     // ---------- mode transitions ----------

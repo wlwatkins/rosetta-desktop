@@ -1,12 +1,15 @@
 # Rust build output
 /target
 
-# Model artifacts: regenerate with tools/setup_model.sh
+# Model artifacts: regenerate with run.cmd setup
 /models
 /models_fp32
 
-# Vendored Tesseract runtime: regenerate with tools/vendor_tesseract.sh
+# Vendored Tesseract runtime: regenerate with run.cmd setup
 /vendor
+
+# Packaged output
+/dist
 
 # Build-time-only Python venv for the model export
 /.venv-export
